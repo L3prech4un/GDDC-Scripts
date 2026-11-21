@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# roles/files.sh - File Server (172.16.X.20, Ubuntu 26.04): scored = ICMP, SSH, FTP, SMB.
+# Hardens vsftpd + Samba without breaking logins by scored users. Rolls back a service if it fails to restart.
+# Env: FTP_CHROOT=0   FTP_ALLOW_ANON=0   SMB_MIN_PROTO=SMB2_10 (set NT1 only if the SMB check fails)   PASV_MIN=40000 PASV_MAX=40100
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; . "$DIR/lib/common.sh"; need_root
+FTP_CHROOT="${FTP_CHROOT:-0}"; FTP_ALLOW_ANON="${FTP_ALLOW_ANON:-0}"; SMB_MIN_PROTO="${SMB_MIN_PROTO:-SMB2_10}"
+PASV_MIN="${PASV_MIN:-40000}"; PASV_MAX="${PASV_MAX:-40100}"
+hdr "FILE SERVER role"
+
+# ---------------------------------------------------------------- vsftpd
+harden_vsftpd() {
+  local c; for c in /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf; do [ -f "$c" ] && break; done
+  [ -f "$c" ] || { info "no vsftpd.conf (FTP daemon might be proftpd/pure-ftpd - harden manually: disable anonymous, restrict root)"; return; }
+  hdr "vsftpd ($c)"
+  v=$(dpkg-query -W -f='${Version}' vsftpd 2>/dev/null); [ -n "$v" ] && info "vsftpd package version: $v"; { echo "$v"; vsftpd -v 2>&1 </dev/null; } | grep -q '2\.3\.4' && bad "[FLAG] vsftpd 2.3.4 = known backdoored release! Reinstall the package."; }
+  listening 6200 && bad "[FLAG] tcp/6200 listening - classic vsftpd-backdoor shell port"
+  have dpkg && dpkg -V vsftpd 2>/dev/null | grep -vE ' c ' | grep '^..5' | while read -r l; do bad "[FLAG] vsftpd package file modified: $l"; done
+  backup_file "$c" /etc/ftpusers /etc/vsftpd.userlist /etc/pam.d/vsftpd
+  grep -nE '^\s*(anon_root|ftp_username|local_root|user_config_dir|chown_username|secure_chroot_dir|ssl_enable|pasv_address|listen_port)' "$c" | sed 's/^/   current: /'
+  if [ "$FTP_ALLOW_ANON" = 1 ]; then info "anonymous FTP left as configured (FTP_ALLOW_ANON=1)"; else set_kv "$c" anonymous_enable NO; fi
+  set_kv "$c" local_enable YES
+  for k in anon_upload_enable anon_mkdir_write_enable anon_other_write_enable; do set_kv "$c" "$k" NO; done
+  sed -i -E '/^\s*no_anon_password\s*=/d' "$c"
+  set_kv "$c" xferlog_enable YES; set_kv "$c" log_ftp_protocol YES
+  set_kv "$c" idle_session_timeout 300; set_kv "$c" data_connection_timeout 120
+  set_kv "$c" max_clients 60; set_kv "$c" max_per_ip 20
+  set_kv "$c" ftpd_banner "FTP service ready."
+  set_kv "$c" pasv_enable YES
+  grep -qE '^\s*pasv_min_port' "$c" || { set_kv "$c" pasv_min_port "$PASV_MIN"; set_kv "$c" pasv_max_port "$PASV_MAX"; info "fixed passive range $PASV_MIN-$PASV_MAX (firewall script opens it)"; }
+  if [ "$FTP_CHROOT" = 1 ]; then set_kv "$c" chroot_local_user YES; set_kv "$c" allow_writeable_chroot YES; warn "FTP chroot ON - if the FTP scoring check can't find its file, set FTP_CHROOT=0 and re-run"; fi
+  # root and system accounts must never FTP in
+  touch /etc/ftpusers; for u in root bin daemon sys; do grep -qx "$u" /etc/ftpusers || echo "$u" >>/etc/ftpusers; done
+  if grep -qE '^\s*userlist_enable\s*=\s*YES' "$c" && [ -f /etc/vsftpd.userlist ]; then
+    grep -nE '^\s*userlist_deny' "$c" | sed 's/^/   /'; warn "vsftpd.userlist is active - confirm scored users are allowed:"; sed 's/^/     /' /etc/vsftpd.userlist; fi
+  # anonymous/ftp home writable by anyone?
+  for d in /srv/ftp /var/ftp /home/ftp; do [ -d "$d" ] && find "$d" -perm -0002 2>/dev/null | head -5 | while read -r f; do bad "[FLAG] world-writable under FTP home: $f"; done; done
+  if [ "$DRY_RUN" != 1 ]; then
+    svc_do restart vsftpd; sleep 2
+    if svc_active vsftpd && listening 21; then ok "vsftpd restarted and listening on 21"; else bad "vsftpd failed to restart - restoring config"; restore_file "$c"; svc_do restart vsftpd; fi
+  fi
+}
+
+# ---------------------------------------------------------------- samba
+harden_samba() {
+  local c=/etc/samba/smb.conf; [ -f "$c" ] || { info "no smb.conf - Samba not installed?"; return; }
+  hdr "Samba ($c)"
+  backup_file "$c"
+  echo "-- shares as currently configured:"; testparm -s 2>/dev/null | awk '/^\[/{s=$0} /path|guest ok|read only|writ|force user|valid users|public/{print "   "s" "$0}' | head -40
+  echo "-- Samba accounts:"; have pdbedit && pdbedit -L 2>/dev/null | cut -d: -f1 | while read -r u; do if is_scored "$u"; then echo "   $u (scored)"; else warn "samba user not in scored list: $u"; fi; done
+  # 1. comment out code-execution / privilege hooks anywhere in the file
+  local hooks='(root preexec|root postexec|preexec|postexec|magic script|magic output|username map script|check password script|add user script|add group script|delete user script|add machine script|logon script|panic action)'
+  grep -niE '^\s*(include|config file)\s*=' "$c" | while read -r l; do warn "smb.conf pulls in another file (review it, not auto-disabled): $l"; done
+  if grep -qiE "^\s*$hooks\s*=" "$c"; then
+    grep -niE "^\s*$hooks\s*=" "$c" | while read -r l; do bad "[FLAG] samba code-exec hook disabled: $l"; done
+    sed -i -E "s/^(\s*$hooks\s*=.*)$/# GDDC-DISABLED: \1/I" "$c"
+  fi
+  # 2. no guest access, no force user/group root, no wide links
+  sed -i -E 's/^(\s*(guest ok|public|guest only)\s*=\s*(yes|true|1)\s*)$/# GDDC-DISABLED: \1/I; s/^(\s*force (user|group)\s*=\s*root\s*)$/# GDDC-DISABLED: \1/I; s/^(\s*wide links\s*=\s*(yes|true|1)\s*)$/# GDDC-DISABLED: \1/I' "$c"
+  # 3. managed block at the END of [global] (Samba: last value wins)
+  sed -i '/^# BEGIN GDDC/,/^# END GDDC/d' "$c"
+  local blk; blk=$(mktemp)
+  cat >"$blk" <<BLK
+# BEGIN GDDC
+   server min protocol = $SMB_MIN_PROTO
+   client min protocol = SMB2_10
+   ntlm auth = ntlmv2-only
+   lanman auth = no
+   map to guest = Never
+   restrict anonymous = 2
+   server signing = auto
+   usershare allow guests = no
+   load printers = no
+   disable spoolss = yes
+   printing = bsd
+   printcap name = /dev/null
+   unix extensions = no
+   allow insecure wide links = no
+   wide links = no
+   log level = 1 auth:3
+# END GDDC
+BLK
+  awk -v blkfile="$blk" '
+    function dump(  l){ while ((getline l < blkfile) > 0) print l; close(blkfile); done=1 }
+    BEGIN{ingl=0; done=0}
+    /^[[:space:]]*\[global\][[:space:]]*$/ {ingl=1; print; next}
+    /^[[:space:]]*\[/ { if (ingl && !done) dump(); ingl=0 }
+    {print}
+    END{ if (ingl && !done) dump(); if (!done) { print "[global]"; dump() } }' "$c" >"$c.gddc.new"
+  rm -f "$blk"
+  if testparm -s "$c.gddc.new" >/dev/null 2>&1; then
+    [ "$DRY_RUN" = 1 ] && { info "dry-run: smb.conf valid"; rm -f "$c.gddc.new"; return; }
+    mv "$c.gddc.new" "$c"; ok "smb.conf hardened"
+  else bad "new smb.conf failed testparm - keeping original:"; testparm -s "$c.gddc.new" 2>&1 | head -5; rm -f "$c.gddc.new"; return; fi
+  local s; for s in smbd smb; do svc_exists "$s" && break; done
+  svc_do restart "$s"; svc_exists nmbd && svc_do restart nmbd; sleep 2
+  if svc_active "$s" && listening 445; then ok "Samba restarted and listening on 445"; else bad "Samba failed to restart - restoring"; restore_file "$c"; svc_do restart "$s"; fi
+  echo "-- share directories that are world-writable (review; not changed automatically):"
+  testparm -s 2>/dev/null | awk -F= '/^\s*path/{gsub(/ /,"",$2); print $2}' | while read -r p; do [ -d "$p" ] && stat -c '   %a %U:%G %n' "$p" && find "$p" -maxdepth 2 -perm -0002 2>/dev/null | head -3 | sed 's/^/   WORLD-WRITABLE: /'; done
+  [ "$SMB_MIN_PROTO" != NT1 ] && info "If the SMB scoring check goes red: re-run with SMB_MIN_PROTO=NT1 (legacy) and tell White Team their checker uses SMB1."
+}
+
+[ -n "${SKIP_FTP:-}" ] || harden_vsftpd
+[ -n "${SKIP_SMB:-}" ] || harden_samba
+hdr "NFS / other file exports"
+[ -s /etc/exports ] && { grep -vE '^\s*(#|$)' /etc/exports | sed 's/^/  /'; warn "NFS exports present - not scored; consider: systemctl disable --now nfs-server"; }
+ok "File-server role done. Next:  sudo $DIR/06_firewall.sh files"
